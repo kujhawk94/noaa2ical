@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+LOG_FILE="/var/log/noaa2ical.log"
+exec >>"${LOG_FILE}" 2>&1
+echo "Updating weather calendar at  $(date '+%Y-%m-%d %H:%M:%S')"
+
+### CONFIGURATION (edit these) ###
+CALENDAR_DIR="/var/www/html"
+CALENDAR_FILE="weather.ics"
+CALENDAR_PATH="${CALENDAR_DIR}/${CALENDAR_FILE}"
+LOCATION="40.589,-105.0825"  # Lat/Lon 4 decimal max, no trailing zeros
+BASE_URL="https://api.weather.gov/points"
+
+# Fetch URLs for hourly and 7-day forecasts
+POINTS_JSON=$(curl -s "${BASE_URL}/${LOCATION}")
+HOURLY_FORECAST_URL=$(echo "$POINTS_JSON" | jq -r '.properties.forecastHourly')
+DAILY_FORECAST_URL=$(echo "$POINTS_JSON" | jq -r '.properties.forecast')
+
+if [ -z "$HOURLY_FORECAST_URL" ] || [ -z "$DAILY_FORECAST_URL" ]; then
+  echo "Error: Unable to fetch forecast URLs for location."
+  exit 1
+fi
+
+# Fetch hourly and daily forecasts
+HOURLY_FORECAST_JSON=$(curl -s "$HOURLY_FORECAST_URL")
+DAILY_FORECAST_JSON=$(curl -s "$DAILY_FORECAST_URL")
+
+if [ -z "$HOURLY_FORECAST_JSON" ] || [ -z "$DAILY_FORECAST_JSON" ]; then
+  echo "Error: Unable to fetch weather forecast data."
+  exit 1
+fi
+
+# Extract hourly and daily forecast periods
+HOURLY_FORECAST_PERIODS=$(echo "$HOURLY_FORECAST_JSON" | jq -c '.properties.periods[]')
+DAILY_FORECAST_PERIODS=$(echo "$DAILY_FORECAST_JSON" | jq -c '.properties.periods[]')
+
+# Key-value arrays simulated using delimiter
+DAILY_DESCRIPTIONS=()  # Stores "DATE=Day: ..., Night: ..."
+HOURLY_STATS=()        # Stores "DATE=HighTemp:...,LowTemp:...,HighWind:...,LowWind:...MaxPrecip:..."
+
+# Process daily forecast periods to build descriptions
+while read -r daily_period; do
+  DATE=$(echo "$daily_period" | jq -r '.startTime' | cut -d'T' -f1)
+  IS_DAYTIME=$(echo "$daily_period" | jq -r '.isDaytime')
+  FORECAST=$(echo "$daily_period" | jq -r '.detailedForecast')
+
+  # Add Day/Night forecast to descriptions
+  if [ "$IS_DAYTIME" = "true" ]; then
+    DAILY_DESCRIPTIONS+=("$DATE=Day: $FORECAST")
+  else
+    # Append Night forecast to existing entry
+    for i in "${!DAILY_DESCRIPTIONS[@]}"; do
+      if [[ "${DAILY_DESCRIPTIONS[i]}" == "$DATE="* ]]; then
+        DAILY_DESCRIPTIONS[i]+=$' Night: '"$FORECAST"
+      fi
+    done
+  fi
+done < <(echo "$DAILY_FORECAST_PERIODS")
+
+# Process hourly forecast periods to compute stats
+while read -r period; do
+  DATE=$(echo "$period" | jq -r '.startTime' | cut -d'T' -f1)
+  TEMP=$(echo "$period" | jq -r '.temperature')
+  WIND_SPEED=$(echo "$period" | jq -r '.windSpeed' | grep -o '^[0-9]*') # Extract numeric part
+  PRECIP_CHANCE=$(echo "$period" | jq -r '.probabilityOfPrecipitation.value' || echo 0)
+
+  # Initialize or update daily stats
+  ENTRY_FOUND=0
+  for i in "${!HOURLY_STATS[@]}"; do
+    if [[ "${HOURLY_STATS[i]}" == "$DATE="* ]]; then
+      ENTRY_FOUND=1
+      # Update values
+      OLD_STATS=${HOURLY_STATS[i]#*=}
+      HIGH_TEMP=$(echo "$OLD_STATS" | grep -o 'HighTemp:[^,]*' | cut -d':' -f2)
+      LOW_TEMP=$(echo "$OLD_STATS" | grep -o 'LowTemp:[^,]*' | cut -d':' -f2)
+      HIGH_WIND=$(echo "$OLD_STATS" | grep -o 'HighWind:[^,]*' | cut -d':' -f2)
+      LOW_WIND=$(echo "$OLD_STATS" | grep -o 'LowWind:[^,]*' | cut -d':' -f2)
+      MAX_PRECIP=$(echo "$OLD_STATS" | grep -o 'MaxPrecip:[^,]*' | cut -d':' -f2)
+
+      HIGH_TEMP=$(($TEMP > $HIGH_TEMP ? $TEMP : $HIGH_TEMP))
+      LOW_TEMP=$(($TEMP < $LOW_TEMP ? $TEMP : $LOW_TEMP))
+      HIGH_WIND=$(($WIND_SPEED > $HIGH_WIND ? $WIND_SPEED : $HIGH_WIND))
+      LOW_WIND=$(($WIND_SPEED < $LOW_WIND ? $WIND_SPEED : $LOW_WIND))
+      MAX_PRECIP=$(($PRECIP_CHANCE > $MAX_PRECIP ? $PRECIP_CHANCE : $MAX_PRECIP))
+
+      HOURLY_STATS[i]="$DATE=HighTemp:$HIGH_TEMP,LowTemp:$LOW_TEMP,LowWind:$LOW_WIND,HighWind:$HIGH_WIND,MaxPrecip:$MAX_PRECIP"
+      break
+    fi
+  done
+
+  # If no entry exists for the date, initialize it
+  if [ $ENTRY_FOUND -eq 0 ]; then
+    HOURLY_STATS+=("$DATE=HighTemp:$TEMP,LowTemp:$TEMP,LowWind:$WIND_SPEED,HighWind:$WIND_SPEED,MaxPrecip:$PRECIP_CHANCE")
+  fi
+done < <(echo "$HOURLY_FORECAST_PERIODS")
+
+
+### BUILD NEW ICS IN TEMPFILE ###
+tmpfile=$(mktemp)
+trap 'rm -f "$tmpfile"' EXIT
+
+cat > "$tmpfile" <<EOF
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//${UID_DOMAIN}//NOAA2ICAL//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+EOF
+
+# Create calendar events for each date
+for entry in "${HOURLY_STATS[@]:0:${#HOURLY_STATS[@]}-1}"; do
+
+  DATE=${entry%%=*}
+  STATS=${entry#*=}
+  DESCRIPTION=""
+  for desc in "${DAILY_DESCRIPTIONS[@]}"; do
+    if [[ "$desc" == "$DATE="* ]]; then
+      DESCRIPTION=${desc#*=}
+      break
+    fi
+  done
+
+  uid="${DATE}@${UID_DOMAIN}"
+  old_seq=$(
+    tr -d '\r' < "${CALENDAR_PATH}" \
+      | grep -A1 "^UID:${uid}$"  \
+      | grep '^SEQUENCE:' \
+      | head -n1 \
+      | cut -d: -f2 \
+      || true
+  )
+  
+  # If nothing was found, default to 0; otherwise bump by one:
+  if [[ -n "$old_seq" ]]; then
+    seq=$((old_seq + 1))
+  else
+    seq=0
+  fi
+  
+  dtstamp=$(date -u +%Y%m%dT%H%M%SZ)
+  dtstart="${DATE}T000000Z"   # adjust per your needs
+  
+  if date --version >/dev/null 2>&1; then
+    # GNU date
+    dtend=$(date -u -d "${DATE} +1 day" +%Y%m%dT%H%M%SZ)
+  else
+    # BSD/macOS date
+    dtend=$(date -u -j -f "%Y-%m-%d" "${DATE}" -v+1d +%Y%m%dT%H%M%SZ)
+  fi
+
+  SUMMARY=$(echo "$STATS" | sed 's/,/ /g' | sed 's/:/ /g' | sed 's/HighTemp /↑/g' | sed 's/LowTemp /↓/g' | sed 's/LowWind /💨/g' | sed 's/HighWind /-/g' | sed 's/MaxPrecip /☔️/g' | sed 's/ //g' )
+
+  # qp_desc=$(qp_encode "$DESCRIPTION")
+  folded_description=$(printf 'DESCRIPTION:%s\n' "$DESCRIPTION" \
+    | fold -s -w 50 \
+    | sed '2,$ s/^/ /'
+  )
+  
+  echo "BEGIN:VEVENT" >> "$tmpfile"
+  echo "UID:$uid" >> "$tmpfile"
+  echo "SEQUENCE:$seq" >> "$tmpfile"
+  echo "DTSTAMP:$dtstamp" >> "$tmpfile"
+  echo "DTSTART;VALUE=DATE:${DATE//-/}" >> "$tmpfile"
+  echo "DTEND;VALUE=DATE:${DATE//-/}" >> "$tmpfile"
+  echo "SUMMARY:$SUMMARY" >> "$tmpfile"
+  printf '%b\n' "$folded_description" >> "$tmpfile"
+  echo "END:VEVENT" >> "$tmpfile"
+done 
+
+echo "END:VCALENDAR" >> "$tmpfile"
+
+sed -i.bak $'s/$/\r/' "$tmpfile" && rm -rf ${tmpfile}.bak   
+          
+# Overwrite the old calendar file
+cp "$tmpfile" "${CALENDAR_PATH}"
+rm -f "$tmpfile"
+trap - EXIT 
+
+echo "[OK] Calendar updated ${#HOURLY_STATS[@]} events into ${CALENDAR_DIR}"
