@@ -12,6 +12,7 @@ CALENDAR_FILE="weather.ics"
 CALENDAR_PATH="${CALENDAR_DIR}/${CALENDAR_FILE}"
 LOCATION="40.589,-105.0825"  # Lat/Lon 4 decimal max, no trailing zeros
 BASE_URL="https://api.weather.gov/points"
+UID_DOMAIN="example.com"
 
 # Fetch URLs for hourly and 7-day forecasts
 POINTS_JSON=$(curl -s "${BASE_URL}/${LOCATION}")
