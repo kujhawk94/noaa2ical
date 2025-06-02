@@ -155,6 +155,7 @@ for entry in "${HOURLY_STATS[@]:0:${#HOURLY_STATS[@]}-1}"; do
 
   # qp_desc=$(qp_encode "$DESCRIPTION")
   folded_description=$(printf 'DESCRIPTION:%s\n' "$DESCRIPTION" \
+    | sed 's/,/\\,/g' \
     | fold -s -w 50 \
     | sed '2,$ s/^/ /'
   )
